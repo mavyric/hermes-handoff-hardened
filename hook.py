@@ -86,6 +86,15 @@ def _is_forked_agent(agent: Any) -> bool:
 # turn (which would make the reviewer try to write a handoff).
 _REVIEW_PROMPT_MARKER = "review the conversation above and update the skill library"
 
+# Fork hardening (2026-10-18 static-security review): the engine now only
+# accepts finalize_handoff once a handoff has been REQUESTED. The automatic
+# paths do request it (system_prompt hook / should_compress / deferred host
+# compaction) — the MANUAL path arrives only as a skill-invocation user turn
+# (agent/skill_commands.py injects 'The user has invoked the "<name>" skill'),
+# so recognise that turn here and record it as the request. Without this, a
+# deliberate /self-handoff below the soft threshold would be refused.
+_SELF_HANDOFF_INVOCATION = ("the user has invoked", "self-handoff")
+
 
 def _resolve_engine(agent: Any) -> Optional[Any]:
     # The live per-agent engine is at .context_compressor (Hermes deep-copies the
@@ -198,13 +207,18 @@ def pre_llm_call_handler(session_id: str = "", **kwargs) -> Optional[Dict[str, A
     """
     if not session_id:
         return None
+    # Fork-local dispatch probe (2026-10-18): confirms whether this hook is
+    # invoked at all on this host. Remove after diagnosis.
+    logger.info("Handoff: pre_llm_call fired for %s (msg %.60r)", session_id,
+                str(kwargs.get("user_message") or ""))
 
     # pre_llm_call gets no `agent`, so a forked review turn can't be identified
     # structurally — but it is recognisable by its harness prompt. Without this,
     # a legitimately-authoring parent would inject "write your handoff now" into
     # the *reviewer's* turn and the reviewer would try to write one.
     user_message = kwargs.get("user_message") or ""
-    if _REVIEW_PROMPT_MARKER in str(user_message).lower():
+    text = str(user_message).lower()
+    if _REVIEW_PROMPT_MARKER in text:
         return None
 
     # No `agent` here — reach the shared state directly. Every engine deep-copy
@@ -212,6 +226,14 @@ def pre_llm_call_handler(session_id: str = "", **kwargs) -> Optional[Dict[str, A
     from .state import HandoffStore
 
     store = HandoffStore()
+    # Manual trigger: a /self-handoff skill turn IS the request (see
+    # _SELF_HANDOFF_INVOCATION). Record it, then let delivery proceed — the
+    # skill's own directive and this instruction ask for the same thing.
+    if all(m in text for m in _SELF_HANDOFF_INVOCATION) and \
+            store.get_phase(session_id) == PHASE_NORMAL:
+        store.set_phase(session_id, PHASE_AUTHORING)
+        logger.info("Handoff: /self-handoff skill turn detected for %s - "
+                    "session moved to 'authoring'; instruction delivered.", session_id)
     if store.get_phase(session_id) != PHASE_AUTHORING:
         return None
 

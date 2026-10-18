@@ -66,6 +66,10 @@ ROUGH_TRUST_FACTOR = 3
 # provider-reported reading has yet revealed the real one. The host's own
 # comment puts 50+ tools at 20-30K; this leaves room for a fat system prompt.
 ASSUMED_OVERHEAD_TOKENS = 60_000
+# Cap on a handoff document read at finalize (fork hardening, static-review
+# Finding 3): a briefing is not an archive — this is well above the ~8k-token
+# intent, yet bounded, so a stray megabyte file cannot ride the seed.
+MAX_HANDOFF_BYTES = 512 * 1024
 # A truncation that keeps at least this fraction of the transcript's size is not
 # relief, it is a rotation: it renames the session and frees nothing.
 NO_RELIEF_KEPT_FRACTION = 0.9
@@ -837,15 +841,14 @@ class HandoffContextEngine(ContextEngine):
             logger.debug("Handoff: could not record event %s: %s", event, exc)
 
     def _swap_in_handoff(self, messages: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
-        path_str = self.store.get_handoff_path(self.session_id)
-        path = Path(path_str) if path_str else self.handoff_path_for(self.session_id)
-
-        try:
-            content = path.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            logger.warning("Handoff: could not read %s: %s", path, exc)
-            return None
+        path_str = self.store.get_handoff_path(self.session_id) or "(captured at finalize)"
+        # Fork hardening (static-review Finding 3 — validate/use mismatch): the
+        # swap carries the text ACCEPTED at finalize, never a fresh read of the
+        # path. What was validated is exactly what crosses the reset.
+        content = (self.store.get_accepted_content(self.session_id) or "").strip()
         if not content:
+            logger.warning("Handoff: phase 'ready' but no accepted content is stored; "
+                           "no swap happens and the safety net will decide.")
             return None
 
         # Record the handoff for the layered prior before consuming it, so the
@@ -903,7 +906,7 @@ class HandoffContextEngine(ContextEngine):
             "Handoff: swapped %d messages for authored handoff (%d chars) from %s "
             "keeping %d recent messages (~%s tokens, budget %s); new session "
             "starts at ~%s tokens excluding system prompt and tools",
-            len(messages), len(content), path, len(tail), f"{tail_tokens:,}",
+            len(messages), len(content), path_str, len(tail), f"{tail_tokens:,}",
             f"{self.keep_tokens:,}", f"{seed_tokens:,}",
         )
         return seed
@@ -1064,6 +1067,34 @@ class HandoffContextEngine(ContextEngine):
 
     # -- Tool surface: finalize_handoff ------------------------------------
 
+    def _read_handoff_document(self, path: Path) -> str:
+        """Bounded, strict-UTF-8 read of a regular file ('' when unusable).
+
+        Fork hardening (static-review Findings 1 & 3): refuse directories and
+        symlinked paths, cap the size, and treat a decode failure as a clean
+        refusal instead of an uncaught UnicodeDecodeError (a ValueError, which
+        the old ``except OSError`` did not catch).
+        """
+        try:
+            if path.is_symlink() or not path.is_file():
+                logger.warning("Handoff: %s is not a regular file; refusing it.", path)
+                return ""
+            with open(path, "rb") as fh:
+                raw = fh.read(MAX_HANDOFF_BYTES + 1)
+        except OSError as exc:
+            logger.warning("Handoff: could not read %s: %s", path, exc)
+            return ""
+        if len(raw) > MAX_HANDOFF_BYTES:
+            logger.warning("Handoff: %s exceeds the %s KiB handoff limit; refusing it.",
+                           path, MAX_HANDOFF_BYTES // 1024)
+            return ""
+        try:
+            text = raw.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            logger.warning("Handoff: %s is not valid UTF-8; refusing it.", path)
+            return ""
+        return text
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [
             {
@@ -1106,23 +1137,43 @@ class HandoffContextEngine(ContextEngine):
                 "message": "Set confirm=true once the handoff document is fully written.",
             })
 
+        # Fork hardening (static-review Finding 1): a handoff may only be
+        # finalized once one has been REQUESTED — the soft threshold, a
+        # deferred host compaction, or a /self-handoff skill turn (hook.py
+        # records that request) — or re-confirmed while already ready.
+        # Without this gate, a single stray tool call could reset the session
+        # using any readable host file as its ground truth.
+        phase = self.store.get_phase(self.session_id)
+        if phase not in (PHASE_AUTHORING, PHASE_READY):
+            return json.dumps({
+                "status": "not_requested",
+                "message": (
+                    "No handoff has been requested for this session. Invoke "
+                    "the /self-handoff skill to hand off deliberately, or "
+                    "keep working until the engine requests a handoff."
+                ),
+            })
+
         path_str = args.get("path") or self.store.get_handoff_path(self.session_id)
         path = Path(path_str) if path_str else self.handoff_path_for(self.session_id)
 
-        try:
-            content = path.read_text(encoding="utf-8").strip()
-        except OSError:
-            content = ""
+        content = self._read_handoff_document(path)
         if not content:
             return json.dumps({
                 "status": "missing",
                 "message": (
-                    f"No non-empty handoff found at {path}. Write the complete "
-                    "handoff document there first, then call finalize_handoff again."
+                    f"No usable handoff found at {path}. It must be a regular "
+                    f"(non-symlink) file of valid UTF-8 under "
+                    f"{MAX_HANDOFF_BYTES // 1024} KiB and non-empty. Write the "
+                    "complete document there first, then call finalize_handoff "
+                    "again."
                 ),
             })
 
+        # Store the accepted text, not just the path: the swap must carry
+        # exactly what was validated here (Finding 3, TOCTOU).
         self.store.set_handoff_path(self.session_id, str(path))
+        self.store.set_accepted_content(self.session_id, content)
         self.store.set_phase(self.session_id, PHASE_READY)
         logger.info("Handoff: finalized for session %s at %s", self.session_id, path)
         self.record_event("handoff_finalized", path=str(path))

@@ -174,6 +174,7 @@ class HandoffTriggerTests(unittest.TestCase):
         e = self._engine()
         doc = self.home / "h.md"
         doc.write_text("## Objective\n- keep going\n")
+        state_mod.HandoffStore().set_phase(e.session_id, state_mod.PHASE_AUTHORING)
         res = json.loads(e.handle_tool_call("finalize_handoff", {"confirm": True, "path": str(doc)}))
         self.assertEqual(res["status"], "ready")
         out = self._engine().compress(_history(), current_tokens=853_747)
@@ -250,6 +251,7 @@ class BoundedTailTests(unittest.TestCase):
         self.e.update_model(model="m", context_length=CTX)
         self.doc = self.home / "h.md"
         self.doc.write_text("## Objective\n- go\n")
+        state_mod.HandoffStore().set_phase(self.e.session_id, state_mod.PHASE_AUTHORING)
         self.e.handle_tool_call("finalize_handoff", {"confirm": True, "path": str(self.doc)})
 
     def _swap(self, msgs):
@@ -543,6 +545,7 @@ class PhantomEstimateTests(unittest.TestCase):
         e.update_from_response({"prompt_tokens": 860_000})
         doc = self.home / "h.md"
         doc.write_text("## Objective\n- go\n")
+        state_mod.HandoffStore().set_phase(e.session_id, state_mod.PHASE_AUTHORING)
         e.handle_tool_call("finalize_handoff", {"confirm": True, "path": str(doc)})
         e.compress(_heavy(860_000), current_tokens=860_000)
         self.assertEqual(e.last_prompt_tokens, -1)  # what the gateway will persist
@@ -555,6 +558,7 @@ class PhantomEstimateTests(unittest.TestCase):
         e.should_compress(860_000)
         doc = self.home / "h.md"
         doc.write_text("## Objective\n- go\n")
+        state_mod.HandoffStore().set_phase(e.session_id, state_mod.PHASE_AUTHORING)
         e.handle_tool_call("finalize_handoff", {"confirm": True, "path": str(doc)})
         e.compress(_heavy(860_000), current_tokens=860_000)
         self.assertEqual(self._phase(), state_mod.PHASE_NORMAL)
@@ -721,14 +725,18 @@ class InTurnPhantomTests(unittest.TestCase):
         self.assertEqual(state_mod.HandoffStore().get_phase(self.sid),
                          state_mod.PHASE_NORMAL)
 
-    def test_unusable_ready_handoff_does_not_loop_on_a_small_transcript(self):
+    def test_emptying_the_file_after_finalize_cannot_block_the_swap(self):
+        """Fork contract (Finding 3): the swap carries the text ACCEPTED at
+        finalize. The old unusable-loop is unreachable by construction now."""
         e = self.e
         doc = self.home / "h.md"
         doc.write_text("## Objective\n- go\n")
+        state_mod.HandoffStore().set_phase(e.session_id, state_mod.PHASE_AUTHORING)
         e.handle_tool_call("finalize_handoff", {"confirm": True, "path": str(doc)})
-        doc.write_text("")  # vanished/empty by swap time
+        doc.write_text("")  # vanished by swap time: accepted text still crosses
         msgs = self._session(9)
-        self.assertEqual(e.compress(msgs, current_tokens=500_000), msgs)
+        out = e.compress(msgs, current_tokens=500_000)
+        self.assertTrue(any(engine_mod.SWAP_MARKER in str(m.get("content")) for m in out))
         self.assertEqual(state_mod.HandoffStore().get_phase(self.sid),
                          state_mod.PHASE_NORMAL)
 
@@ -757,6 +765,7 @@ class SessionRotationTests(unittest.TestCase):
         e.update_model(model="m", context_length=CTX)
         doc = self.home / "h.md"
         doc.write_text("## Objective\n- PRIOR-MARKER\n")
+        state_mod.HandoffStore().set_phase(e.session_id, state_mod.PHASE_AUTHORING)
         e.handle_tool_call("finalize_handoff", {"confirm": True, "path": str(doc)})
         e.compress(_history(4), current_tokens=853_747)
         e.on_session_start("new", hermes_home=str(self.home),
@@ -781,6 +790,7 @@ class SessionRotationTests(unittest.TestCase):
         e.update_model(model="m", context_length=CTX)
         doc = self.home / "h.md"
         doc.write_text("## Objective\n- x\n")
+        state_mod.HandoffStore().set_phase(e.session_id, state_mod.PHASE_AUTHORING)
         e.handle_tool_call("finalize_handoff", {"confirm": True, "path": str(doc)})
         e.compress(_history(4), current_tokens=853_747)
         e.on_session_start("new", hermes_home=str(self.home),
@@ -793,8 +803,8 @@ class SessionRotationTests(unittest.TestCase):
         self.assertIn("seconds_since_swap", req)
 
 
-if __name__ == "__main__":
-    unittest.main()
+# NOTE: the unittest.main() block lives at the END of this file: classes defined
+# after it are never collected when running the file directly (upstream pitfall).
 
 
 class EstimateOnlyClimbTests(unittest.TestCase):
@@ -864,3 +874,101 @@ class ProviderReadingSurvivesEngineCopiesTests(EstimateOnlyClimbTests):
         first._forget_size_readings()
         self.assertIsNone(state_mod.HandoffStore().get_real_reading(self.sid))
         self.assertIsNone(self._engine().current_pressure())
+
+
+class ForkHardeningTests(unittest.TestCase):
+    """Fork-local contract (2026-10-18 static-security review): finalize only
+    after a request; bounded, strict, regular-file reads; the swap uses the
+    content accepted at finalize, never a later read of the path."""
+
+    def setUp(self):
+        state_mod._STATE.clear()
+        self.home = Path(tempfile.mkdtemp(prefix="handoff-test-fork-"))
+        self.sid = f"sess-fork-{self._testMethodName}"
+
+    def _engine(self):
+        e = engine_mod.HandoffContextEngine()
+        e.on_session_start(self.sid, hermes_home=str(self.home))
+        e.update_model(model="m", context_length=CTX)
+        return e
+
+    def _request(self):
+        state_mod.HandoffStore().set_phase(self.sid, state_mod.PHASE_AUTHORING)
+
+    def _phase(self):
+        return state_mod.HandoffStore().get_phase(self.sid)
+
+    def _finalize(self, e, doc):
+        return json.loads(e.handle_tool_call(
+            "finalize_handoff", {"confirm": True, "path": str(doc)}))
+
+    def test_finalize_rejected_when_nothing_was_requested(self):
+        e = self._engine()
+        doc = self.home / "h.md"
+        doc.write_text("## Objective\n- keep going\n")
+        self.assertEqual(self._finalize(e, doc)["status"], "not_requested")
+        self.assertEqual(self._phase(), state_mod.PHASE_NORMAL)
+
+    def test_finalize_accepted_after_request(self):
+        e = self._engine()
+        self._request()
+        doc = self.home / "h.md"
+        doc.write_text("## Objective\n- keep going\n")
+        self.assertEqual(self._finalize(e, doc)["status"], "ready")
+        self.assertEqual(state_mod.HandoffStore().get_accepted_content(self.sid),
+                         "## Objective\n- keep going")
+
+    def test_finalize_refuses_non_utf8(self):
+        e = self._engine()
+        self._request()
+        doc = self.home / "h.md"
+        doc.write_bytes(b"\xff\xfe not utf-8")
+        self.assertEqual(self._finalize(e, doc)["status"], "missing")
+        self.assertEqual(self._phase(), state_mod.PHASE_AUTHORING)
+
+    def test_finalize_refuses_oversized_and_symlink(self):
+        e = self._engine()
+        self._request()
+        big = self.home / "big.md"
+        big.write_text("x" * (engine_mod.MAX_HANDOFF_BYTES + 1))
+        self.assertEqual(self._finalize(e, big)["status"], "missing")
+        good = self.home / "real.md"
+        good.write_text("## Objective\n- ok\n")
+        link = self.home / "link.md"
+        link.symlink_to(good)
+        self.assertEqual(self._finalize(e, link)["status"], "missing")
+        self.assertEqual(self._finalize(e, good)["status"], "ready")
+
+    def test_swap_uses_accepted_content_not_the_later_file(self):
+        e = self._engine()
+        self._request()
+        doc = self.home / "h.md"
+        doc.write_text("## Objective\n- original\n")
+        self._finalize(e, doc)
+        doc.write_text("## Objective\n- HIJACKED\n")  # TOCTOU attempt
+        out = self._engine().compress(_history(), current_tokens=853_747)
+        joined = "\n".join(str(m.get("content", "")) for m in out)
+        self.assertIn("original", joined)
+        self.assertNotIn("HIJACKED", joined)
+        self.assertEqual(self._phase(), state_mod.PHASE_NORMAL)
+
+    def test_manual_skill_turn_requests_the_handoff_and_injects(self):
+        self._engine()
+        msg = ('[IMPORTANT: The user has invoked the "self-handoff" skill, '
+               'indicating they want to hand off now.]')
+        ctx = hook_mod.pre_llm_call_handler(session_id=self.sid, user_message=msg)
+        self.assertEqual(self._phase(), state_mod.PHASE_AUTHORING)
+        self.assertIsNotNone(ctx)
+        self.assertIn("HANDOFF", ctx["context"])
+
+    def test_ordinary_turn_neither_requests_nor_injects(self):
+        self._engine()
+        ctx = hook_mod.pre_llm_call_handler(
+            session_id=self.sid,
+            user_message="What does 'invoked' mean, and what is self-handoff?")
+        self.assertIsNone(ctx)
+        self.assertEqual(self._phase(), state_mod.PHASE_NORMAL)
+
+
+if __name__ == "__main__":
+    unittest.main()

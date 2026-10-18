@@ -32,7 +32,8 @@ def _entry(session_id: str) -> dict:
     if e is None:
         e = {"phase": PHASE_NORMAL, "handoff_path": None, "swap_count": 0,
              "usage": 0.0, "urgent": False, "last_handoff": None,
-             "usage_detail": None, "swapped_at": None}
+             "usage_detail": None, "swapped_at": None,
+             "accepted_content": None}
         _STATE[session_id] = e
     return e
 
@@ -53,8 +54,11 @@ class HandoffStore:
             e = _entry(session_id)
             e["phase"] = phase
             if phase == PHASE_NORMAL:
-                # A new cycle must not inherit the last cycle's measured figure.
+                # A new cycle must not inherit the last cycle's measured
+                # figure, path, or accepted text.
                 e["usage_detail"] = None
+                e["handoff_path"] = None
+                e["accepted_content"] = None
 
     def get_handoff_path(self, session_id: str) -> Optional[str]:
         with _LOCK:
@@ -63,6 +67,15 @@ class HandoffStore:
     def set_handoff_path(self, session_id: str, path: Optional[str]) -> None:
         with _LOCK:
             _entry(session_id)["handoff_path"] = path
+
+    def get_accepted_content(self, session_id: str) -> Optional[str]:
+        """The exact text validated at finalize; the swap uses THIS, not the file."""
+        with _LOCK:
+            return _entry(session_id).get("accepted_content")
+
+    def set_accepted_content(self, session_id: str, content: Optional[str]) -> None:
+        with _LOCK:
+            _entry(session_id)["accepted_content"] = content
 
     def get_usage(self, session_id: str) -> float:
         """Context usage (0..1) recorded when authoring was triggered.
@@ -199,5 +212,5 @@ class HandoffStore:
                 "phase": PHASE_NORMAL, "handoff_path": None,
                 "swap_count": 0, "usage": 0.0, "urgent": False,
                 "last_handoff": None, "usage_detail": None,
-                "swapped_at": None,
+                "swapped_at": None, "accepted_content": None,
             }

@@ -34,5 +34,19 @@ def register(ctx):
     # message rather than the system prompt, which is the only channel strong
     # enough to actually get acted on. An ambient system-prompt nudge fired
     # correctly twice in live use and converted zero times.
-    ctx.register_hook("system_prompt", system_prompt_handler)
-    ctx.register_hook("pre_llm_call", pre_llm_call_handler)
+    # Fork-local (2026-10-18): `system_prompt` is not in this host's
+    # VALID_HOOKS; registering an unknown hook draws an ERROR and the hook
+    # never fires. Register only what the host can dispatch; detection also
+    # runs inside the engine (should_compress), so nothing is lost here.
+    try:
+        from hermes_cli.plugins import VALID_HOOKS
+        def _valid(name):
+            return name in VALID_HOOKS
+    except Exception:
+        def _valid(name):
+            return True
+
+    if _valid("system_prompt"):
+        ctx.register_hook("system_prompt", system_prompt_handler)
+    if _valid("pre_llm_call"):
+        ctx.register_hook("pre_llm_call", pre_llm_call_handler)

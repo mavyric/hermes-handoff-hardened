@@ -3,4 +3,9 @@ description: "Instead of mechanically compressing, the agent writes its own hand
 version: "0.1.0"
 author: "Forge ⚒️ & Donald 🧙‍♂️"
 homepage: "https://github.com/witt3rd/hermes-handoff-context-engine"
+# Fork-local: this host's plugin doctor dispatches declared hooks; undeclared
+# registrations drew a warning. (system_prompt is host-version-dependent and is
+# registered conditionally in __init__.py — not declared here.)
+provides_hooks:
+  - pre_llm_call
 requirements: []   # pure standard library — no third-party dependencies
