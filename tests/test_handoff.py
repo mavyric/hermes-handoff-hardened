@@ -970,5 +970,68 @@ class ForkHardeningTests(unittest.TestCase):
         self.assertEqual(self._phase(), state_mod.PHASE_NORMAL)
 
 
+class TestDualImportStateSharing(unittest.TestCase):
+    """The live failure these pin (measured 2026-10-19): when one directory is
+    both an enabled plugin and the selected context.engine, Hermes imports it
+    twice — ``hermes_plugins.<name>`` (hooks) and
+    ``_hermes_user_context_engine.<name>`` (the live engine). Each copy used to
+    import its OWN state module, so the engine's 'authoring' phase was
+    invisible to the delivery hook (instruction never injected) and
+    ``finalize_handoff`` returned 'not_requested' forever: 0 finalizations,
+    0 swaps, every request ended in lossy truncation. These load the package
+    under two unrelated namespaces — exactly what the host does — and drive
+    the broken chain end to end. If state ever un-pins, every test here fails.
+    """
+
+    def setUp(self):
+        state_mod._STATE.clear()
+        self.home = Path(tempfile.mkdtemp(prefix="handoff-dual-import-"))
+
+    def _copy(self, ns):
+        spec = importlib.util.spec_from_file_location(
+            ns, REPO / "__init__.py", submodule_search_locations=[str(REPO)])
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[ns] = mod
+        spec.loader.exec_module(mod)
+        return (sys.modules[f"{ns}.state"], sys.modules[f"{ns}.engine"],
+                sys.modules[f"{ns}.hook"])
+
+    def test_two_namespace_copies_share_one_state_dict(self):
+        sa, _, _ = self._copy("handoff_dupe_a")
+        sb, _, _ = self._copy("handoff_dupe_b")
+        self.assertIs(sa._STATE, sb._STATE)
+        sa.HandoffStore().set_phase("sess-dual-visible", sa.PHASE_AUTHORING)
+        self.assertEqual(sb.HandoffStore().get_phase("sess-dual-visible"),
+                         sb.PHASE_AUTHORING)
+
+    def test_engine_request_delivers_through_the_other_copies_hook(self):
+        sa, ea, _ = self._copy("handoff_dupe_c")
+        _, _, hb = self._copy("handoff_dupe_d")
+        sid = "sess-dual-delivery"
+        eng = ea.HandoffContextEngine()
+        eng.on_session_start(sid, hermes_home=str(self.home))
+        eng.update_model(model="m", context_length=CTX)
+        self.assertTrue(eng.request_handoff(0.80, "test", tokens=int(CTX * 0.8)))
+        injected = hb.pre_llm_call_handler(session_id=sid, user_message="continue")
+        self.assertIsNotNone(injected)          # pre-fix: None (split state)
+        self.assertIn("HANDOFF", injected["context"])
+
+    def test_finalize_across_copies_is_accepted_not_not_requested(self):
+        sa, ea, _ = self._copy("handoff_dupe_e")
+        sb, _, hb = self._copy("handoff_dupe_f")
+        sid = "sess-dual-finalize"
+        eng = ea.HandoffContextEngine()
+        eng.on_session_start(sid, hermes_home=str(self.home))
+        eng.update_model(model="m", context_length=CTX)
+        eng.request_handoff(0.80, "test", tokens=int(CTX * 0.8))
+        hb.pre_llm_call_handler(session_id=sid, user_message="continue")
+        doc = self.home / "handoff.md"
+        doc.write_text("## Objective\n- dual-import regression\n")
+        res = json.loads(eng.handle_tool_call(
+            "finalize_handoff", {"confirm": True, "path": str(doc)}))
+        self.assertEqual(res["status"], "ready")  # pre-fix: not_requested
+        self.assertEqual(sb.HandoffStore().get_phase(sid), state_mod.PHASE_READY)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -10,11 +10,25 @@ the copies (and the system_prompt hook) all import THIS module, so they share
 this one ``_STATE`` dict. ``HandoffStore`` instances are stateless facades over
 it — deep-copying one copies nothing that matters.
 
+Namespace pin (2026-10-19): that premise broke in live use. When the same
+directory is both an enabled plugin and the selected ``context.engine``,
+Hermes imports it TWICE under different package names — ``hermes_plugins.<name>``
+(the hook surfaces) and ``_hermes_user_context_engine.<name>`` (the live
+engine, see plugins/context_engine/__init__.py) — and each copy used to get
+its OWN ``_STATE``. The engine's 'authoring' phase was then invisible to the
+delivery hook (the instruction never reached a user turn) and ``finalize_handoff``
+was gated to 'not_requested' forever: 0 finalizations, 0 swaps; every request
+ended in lossy truncation. The dict and lock are therefore anchored on
+``builtins``, the one module every in-process import shares. This requires the
+engine and hooks to run in the SAME process (the current ``plugins.isolation``
+default); a future 'host' isolation would need a file- or socket-backed store.
+
 Deliberately NOT persistent: if the gateway restarts mid-handoff the state is
 lost, which is harmless — just re-trigger ``/self-handoff``. The handoff
 *documents* the agent writes are ordinary files and are unaffected.
 """
 
+import builtins
 import threading
 import time
 from typing import Dict, Optional
@@ -23,8 +37,17 @@ PHASE_NORMAL = "normal"
 PHASE_AUTHORING = "authoring"
 PHASE_READY = "ready"
 
-_LOCK = threading.Lock()
-_STATE: Dict[str, dict] = {}
+# Anchor on `builtins` so every copy of this module — no matter which package
+# namespace imported it (plugin system, context-engine loader, test harness) —
+# binds to the SAME dict and lock. See module docstring for the live failure.
+_ANCHOR = "_hermes_handoff_shared_state"
+_shared = getattr(builtins, _ANCHOR, None)
+if _shared is None:
+    _shared = {"lock": threading.Lock(), "state": {}}
+    setattr(builtins, _ANCHOR, _shared)
+
+_LOCK = _shared["lock"]
+_STATE: Dict[str, dict] = _shared["state"]
 
 
 def _entry(session_id: str) -> dict:
