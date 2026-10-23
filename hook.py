@@ -348,9 +348,10 @@ Write to this EXACT structure — keep every section, even when empty:
 2. Save it to a markdown file using your file-editing tools.
 3. Call the `finalize_handoff` tool with `confirm: true` and `path:` set to the
    exact file you wrote.
-4. Then stop and end your turn. The session resets into a fresh context seeded
-   with your handoff plus your most recent turns, and next-you continues from
-   there.
+4. Then continue the task you were working on, in this same turn. The session
+   resets into a fresh context seeded with your handoff plus your most recent
+   turns at your very next step, so carry straight on — do not stop to wait for
+   a user message.
 
 This document is the primary thing that crosses the reset. Everything you
 learned here that isn't in it is lost."""

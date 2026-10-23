@@ -38,9 +38,10 @@ Do this, in order:
    - `confirm: true`
    - `path:` the exact path of the file you just wrote.
 
-4. **Stop.** After `finalize_handoff` returns, end your turn. Do not start new
-   work — the session is about to reset into a fresh context seeded with your
-   handoff, and your next self will pick up from the document.
+4. **Continue.** After `finalize_handoff` returns, the reset lands at your very
+   next step: the session becomes a fresh context seeded with your handoff and
+   your most recent turns. Pick the paused task straight back up and carry on in
+   the same turn — do not stop to wait for a user message.
 
 If the `finalize_handoff` tool is not available, the handoff context engine
 isn't active in this session — in that case just write the handoff file and tell

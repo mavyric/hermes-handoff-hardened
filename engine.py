@@ -1103,8 +1103,9 @@ class HandoffContextEngine(ContextEngine):
                     "Call this ONLY after you have finished writing your COMPLETE "
                     "handoff document to the path given in the handoff directive. "
                     "It resets the session into a fresh context seeded with that "
-                    "handoff. After calling it, stop working and end your turn — do "
-                    "not start new work, the transcript is about to be replaced."
+                    "handoff, effective at your very next step. Then continue the "
+                    "task you were working on, right here in the same turn — do "
+                    "not stop to wait for the user."
                 ),
                 "parameters": {
                     "type": "object",
@@ -1180,8 +1181,10 @@ class HandoffContextEngine(ContextEngine):
         return json.dumps({
             "status": "ready",
             "message": (
-                "Handoff accepted. The session will now reset into a fresh context "
-                "seeded with your handoff. Stop here and end your turn."
+                "Handoff accepted. The session resets into a fresh context seeded "
+                "with your handoff plus your most recent turns, effective at your "
+                "next step. Continue the interrupted task in this same turn — do "
+                "not stop to wait for the user."
             ),
         })
 

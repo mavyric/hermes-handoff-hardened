@@ -1033,5 +1033,65 @@ class TestDualImportStateSharing(unittest.TestCase):
         self.assertEqual(sb.HandoffStore().get_phase(sid), state_mod.PHASE_READY)
 
 
+class MidTurnContinuationTests(unittest.TestCase):
+    """Master's contract (2026-10-24): after finalize the agent must CONTINUE the
+    interrupted task in the same turn. The mechanism already supports it — phase
+    READY keeps should_compress() true and compress() swaps, exactly like the
+    built-in compressor mid-turn — but every instruction told the agent to stop
+    and end the turn, so autonomous runs stalled until the user typed
+    'continue'. These tests pin the continuation contract (text) and the
+    mechanism that makes it possible (mid-turn swap)."""
+
+    def setUp(self):
+        state_mod._STATE.clear()
+        self.home = Path(tempfile.mkdtemp(prefix="handoff-test-continuation-"))
+        self.sid = f"sess-cont-{self._testMethodName}"
+
+    def _engine(self):
+        e = engine_mod.HandoffContextEngine()
+        e.on_session_start(self.sid, hermes_home=str(self.home))
+        e.update_model(model="m", context_length=CTX)
+        return e
+
+    def _finalized(self, e):
+        state_mod.HandoffStore().set_phase(self.sid, state_mod.PHASE_AUTHORING)
+        doc = self.home / "h.md"
+        doc.write_text("## Objective\n- keep going\n")
+        out = json.loads(e.handle_tool_call(
+            "finalize_handoff", {"confirm": True, "path": str(doc)}))
+        self.assertEqual(out["status"], "ready")
+        return out
+
+    def test_finalize_reply_sends_the_agent_back_to_work(self):
+        e = self._engine()
+        msg = self._finalized(e)["message"]
+        self.assertNotIn("end your turn", msg)
+        self.assertRegex(msg, r"(?i)continue the interrupted task")
+
+    def test_finalize_tool_schema_does_not_order_the_agent_to_stop(self):
+        e = self._engine()
+        desc = e.get_tool_schemas()[0]["description"]
+        self.assertNotIn("end your turn", desc)
+        self.assertRegex(desc, r"(?i)continue the task")
+
+    def test_ready_handoff_fires_mid_turn_and_swaps(self):
+        # The mechanism behind autonomy: after finalize, the host's pre-API
+        # should_compress says yes and compress swaps, so the SAME turn carries
+        # on with the fresh context — no user message is required.
+        e = self._engine()
+        self._finalized(e)
+        self.assertTrue(e.should_compress())
+        out = e.compress(_history(4), current_tokens=int(CTX * 0.9))
+        self.assertTrue(any(engine_mod.SWAP_MARKER in (m.get("content") or "")
+                            for m in out if m.get("role") != "system"))
+        self.assertEqual(state_mod.HandoffStore().get_phase(self.sid),
+                         state_mod.PHASE_NORMAL)
+
+    def test_instruction_directs_continuation_after_finalize(self):
+        text = hook_mod._instruction(0.8, False)
+        self.assertNotIn("Then stop and end your turn", text)
+        self.assertRegex(text, r"(?i)continue the task")
+
+
 if __name__ == "__main__":
     unittest.main()
